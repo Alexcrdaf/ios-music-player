@@ -67,7 +67,7 @@ export async function searchTracks(query: string): Promise<SearchTrack[]> {
       const metaRegex = /data-musmeta='([^']+)'/g;
       let m;
       let count = 0;
-      while ((m = metaRegex.exec(html)) !== null && count < 25) {
+      while ((m = metaRegex.exec(html)) !== null && count < 30) {
         try {
           const item = JSON.parse(m[1]);
           if (item.url && item.title) {
@@ -75,16 +75,24 @@ export async function searchTracks(query: string): Promise<SearchTrack[]> {
             const trackArtist = decodeHtmlEntities(item.artist || 'Неизвестный исполнитель');
             const key = `${trackTitle.toLowerCase()}_${trackArtist.toLowerCase()}`;
 
+            let rawUrl: string = item.url;
+            if (rawUrl.startsWith('/')) {
+              rawUrl = `https://rus.hitmotop.com${rawUrl}`;
+            }
+
+            // Route through server proxy so iOS Safari never gets blocked by third-party CDN referer or CORS issues
+            const audioProxyUrl = `/api/stream?url=${encodeURIComponent(rawUrl)}`;
+
             if (!seenTracks.has(key)) {
               seenTracks.add(key);
               results.push({
-                id: `hitmo_${item.id || count}_${Date.now()}_${count}`,
+                id: `hitmo_${item.id || count}_${count}`,
                 title: trackTitle,
                 artist: trackArtist,
                 album: 'Single',
                 duration: 0,
                 image: item.img || '',
-                audioUrl: item.url,
+                audioUrl: audioProxyUrl,
                 source: 'hitmo',
               });
               count++;
