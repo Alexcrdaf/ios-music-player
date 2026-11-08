@@ -8,7 +8,7 @@ export interface SearchTrack {
   duration: number;
   image: string;
   audioUrl: string;
-  source: 'ym' | 'muzofond' | 'hitmo' | 'saavn' | 'audius';
+  source: 'ym' | 'muzofond' | 'hitmo' | 'saavn';
 }
 
 function decryptDES(encrypted: string): string | null {
@@ -20,7 +20,7 @@ function decryptDES(encrypted: string): string | null {
     decipher.update(forge.util.createBuffer(encryptedBytes));
     decipher.finish();
     return decipher.output.toString();
-  } catch (err) {
+  } catch {
     return null;
   }
 }
@@ -38,208 +38,218 @@ function decodeHtmlEntities(str: string): string {
     .replace(/&nbsp;/g, ' ');
 }
 
-export async function searchTracks(query: string): Promise<SearchTrack[]> {
-  const cleanQuery = query.trim();
-  if (!cleanQuery) return [];
-
-  const results: SearchTrack[] = [];
-  const seenKeys = new Set<string>();
-
-  // 1. Primary Source: Yandex Music Catalog (Finds "Свидетельство о смерти", "Burial - Forgive", Russian & Global discographies)
+// Fast fetch with guaranteed timeout so Vercel serverless function never times out (502 / 504)
+async function fetchWithTimeout(url: string, options: RequestInit = {}, timeoutMs = 3500) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const ymRes = await fetch(
-      `https://api.music.yandex.net/search?text=${encodeURIComponent(cleanQuery)}&type=all&page=0`,
+    const res = await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+    return res;
+  } finally {
+    clearTimeout(id);
+  }
+}
+
+// 1. Yandex Music Search (Accurate discographies, full albums, indie & rock)
+async function searchYandex(query: string): Promise<SearchTrack[]> {
+  try {
+    const res = await fetchWithTimeout(
+      `https://api.music.yandex.net/search?text=${encodeURIComponent(query)}&type=all&page=0`,
       {
         headers: {
           'User-Agent':
-            'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko)',
+            'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15',
           Accept: 'application/json',
         },
-        cache: 'no-store',
-      }
+      },
+      3000
     );
 
-    if (ymRes.ok) {
-      const ymData = await ymRes.json();
-      const tracks = ymData.result?.tracks?.results || [];
-      for (const t of tracks.slice(0, 20)) {
-        const title = decodeHtmlEntities(t.title || 'Unknown Title');
-        const artist = decodeHtmlEntities(t.artists?.map((a: any) => a.name).join(', ') || 'Unknown Artist');
-        const key = `${title.toLowerCase()}_${artist.toLowerCase()}`;
-
-        if (!seenKeys.has(key)) {
-          seenKeys.add(key);
-          const artwork = t.coverUri
-            ? `https://${t.coverUri.replace('%%', '400x400')}`
-            : '';
-
-          results.push({
-            id: `ym_${t.id}`,
-            title,
-            artist,
-            album: t.albums?.[0]?.title || '',
-            duration: Math.round((t.durationMs || 0) / 1000),
-            image: artwork,
-            audioUrl: `/api/stream?source=ym&id=${t.id}`,
-            source: 'ym',
-          });
-        }
-      }
-    }
-  } catch (err) {
-    console.error('YM search error:', err);
+    if (!res.ok) return [];
+    const data = await res.json();
+    const tracks = data.result?.tracks?.results || [];
+    return tracks.slice(0, 20).map((t: any) => ({
+      id: `ym_${t.id}`,
+      title: decodeHtmlEntities(t.title || 'Unknown Title'),
+      artist: decodeHtmlEntities(t.artists?.map((a: any) => a.name).join(', ') || 'Unknown Artist'),
+      album: t.albums?.[0]?.title || '',
+      duration: Math.round((t.durationMs || 0) / 1000),
+      image: t.coverUri ? `https://${t.coverUri.replace('%%', '400x400')}` : '',
+      audioUrl: `/api/stream?source=ym&id=${t.id}`,
+      source: 'ym' as const,
+    }));
+  } catch {
+    return [];
   }
+}
 
-  // 2. Secondary Source: Muzofond (Finds rare underground tracks, "Свидетельство о смерти", indie bootlegs)
+// 2. Muzofond Search (Rare songs, alternative archives)
+async function searchMuzofond(query: string): Promise<SearchTrack[]> {
   try {
-    const muzoRes = await fetch(`https://muzofond.fm/search/${encodeURIComponent(cleanQuery)}`, {
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        Accept: 'text/html,application/xhtml+xml',
-        'Accept-Language': 'ru-RU,ru;q=0.9,en;q=0.8',
+    const res = await fetchWithTimeout(
+      `https://muzofond.fm/search/${encodeURIComponent(query)}`,
+      {
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          Accept: 'text/html,application/xhtml+xml',
+          'Accept-Language': 'ru-RU,ru;q=0.9,en;q=0.8',
+        },
       },
-      cache: 'no-store',
-    });
+      3000
+    );
 
-    if (muzoRes.ok) {
-      const html = await muzoRes.text();
-      const trackRegex =
-        /<li[^>]+class="item"[^>]*data-id="([^"]+)"[\s\S]*?data-url="(https:\/\/[^"]*muzofond\.fm\/[^"]+)"[\s\S]*?<span[^>]+class="artist">([\s\S]*?)<\/span>[\s\S]*?<a[^>]+data-trackLink[^>]*>([\s\S]*?)<\/a>/g;
-      let m;
-      let count = 0;
-      while ((m = trackRegex.exec(html)) !== null && count < 20) {
-        const streamUrl = m[2];
-        const artist = decodeHtmlEntities(m[3].replace(/<[^>]+>/g, '').trim());
-        const title = decodeHtmlEntities(m[4].replace(/<[^>]+>/g, '').trim());
-        const key = `${title.toLowerCase()}_${artist.toLowerCase()}`;
+    if (!res.ok) return [];
+    const html = await res.text();
+    const trackRegex =
+      /<li[^>]+class="item"[^>]*data-id="([^"]+)"[\s\S]*?data-url="(https:\/\/[^"]*muzofond\.fm\/[^"]+)"[\s\S]*?<span[^>]+class="artist">([\s\S]*?)<\/span>[\s\S]*?<a[^>]+data-trackLink[^>]*>([\s\S]*?)<\/a>/g;
 
-        if (!seenKeys.has(key)) {
-          seenKeys.add(key);
-          results.push({
-            id: `muzofond_${m[1]}_${count}`,
-            title,
-            artist,
-            album: 'Single',
-            duration: 0,
-            image: '',
-            audioUrl: `/api/stream?url=${encodeURIComponent(streamUrl)}`,
-            source: 'muzofond',
-          });
-          count++;
-        }
-      }
+    const list: SearchTrack[] = [];
+    let m;
+    let count = 0;
+    while ((m = trackRegex.exec(html)) !== null && count < 15) {
+      const streamUrl = m[2];
+      const artist = decodeHtmlEntities(m[3].replace(/<[^>]+>/g, '').trim());
+      const title = decodeHtmlEntities(m[4].replace(/<[^>]+>/g, '').trim());
+      list.push({
+        id: `muzofond_${m[1]}_${count}`,
+        title,
+        artist,
+        album: 'Single',
+        duration: 0,
+        image: '',
+        audioUrl: `/api/stream?url=${encodeURIComponent(streamUrl)}`,
+        source: 'muzofond' as const,
+      });
+      count++;
     }
-  } catch (err) {
-    console.error('Muzofond search error:', err);
+    return list;
+  } catch {
+    return [];
   }
+}
 
-  // 3. Third Source: Hitmo (for hits, rap, and CIS pop)
+// 3. Hitmo Search
+async function searchHitmo(query: string): Promise<SearchTrack[]> {
   try {
-    const hitmoRes = await fetch(
-      `https://rus.hitmotop.com/search?q=${encodeURIComponent(cleanQuery)}`,
+    const res = await fetchWithTimeout(
+      `https://rus.hitmotop.com/search?q=${encodeURIComponent(query)}`,
       {
         headers: {
           'User-Agent':
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
           Accept: 'text/html,application/xhtml+xml',
         },
-        cache: 'no-store',
-      }
+      },
+      3000
     );
 
-    if (hitmoRes.ok) {
-      const html = await hitmoRes.text();
-      const metaRegex = /data-musmeta='([^']+)'/g;
-      let m;
-      let count = 0;
-      while ((m = metaRegex.exec(html)) !== null && count < 15) {
-        try {
-          const item = JSON.parse(m[1]);
-          if (item.url && item.title) {
-            const trackTitle = decodeHtmlEntities(item.title);
-            const trackArtist = decodeHtmlEntities(item.artist || 'Неизвестный исполнитель');
-            const key = `${trackTitle.toLowerCase()}_${trackArtist.toLowerCase()}`;
-
-            let rawUrl: string = item.url;
-            if (rawUrl.startsWith('/')) {
-              rawUrl = `https://rus.hitmotop.com${rawUrl}`;
-            }
-
-            if (!seenKeys.has(key)) {
-              seenKeys.add(key);
-              results.push({
-                id: `hitmo_${item.id || count}_${count}`,
-                title: trackTitle,
-                artist: trackArtist,
-                album: 'Single',
-                duration: 0,
-                image: item.img || '',
-                audioUrl: `/api/stream?url=${encodeURIComponent(rawUrl)}`,
-                source: 'hitmo',
-              });
-              count++;
-            }
+    if (!res.ok) return [];
+    const html = await res.text();
+    const metaRegex = /data-musmeta='([^']+)'/g;
+    const list: SearchTrack[] = [];
+    let m;
+    let count = 0;
+    while ((m = metaRegex.exec(html)) !== null && count < 15) {
+      try {
+        const item = JSON.parse(m[1]);
+        if (item.url && item.title) {
+          let rawUrl: string = item.url;
+          if (rawUrl.startsWith('/')) {
+            rawUrl = `https://rus.hitmotop.com${rawUrl}`;
           }
-        } catch {}
-      }
+          list.push({
+            id: `hitmo_${item.id || count}_${count}`,
+            title: decodeHtmlEntities(item.title),
+            artist: decodeHtmlEntities(item.artist || 'Неизвестный исполнитель'),
+            album: 'Single',
+            duration: 0,
+            image: item.img || '',
+            audioUrl: `/api/stream?url=${encodeURIComponent(rawUrl)}`,
+            source: 'hitmo' as const,
+          });
+          count++;
+        }
+      } catch {}
     }
-  } catch (err) {
-    console.error('Hitmo search error:', err);
+    return list;
+  } catch {
+    return [];
   }
+}
 
-  // 4. Fourth Source: International Catalog (JioSaavn 320kbps streams)
+// 4. JioSaavn Search (International 320kbps catalog)
+async function searchSaavn(query: string): Promise<SearchTrack[]> {
   try {
-    const res = await fetch(
-      `https://www.jiosaavn.com/api.php?__call=search.getResults&_format=json&_marker=0&q=${encodeURIComponent(cleanQuery)}&p=1&n=15`,
+    const res = await fetchWithTimeout(
+      `https://www.jiosaavn.com/api.php?__call=search.getResults&_format=json&_marker=0&q=${encodeURIComponent(query)}&p=1&n=10`,
       {
         headers: {
-          'User-Agent':
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
           Accept: 'application/json',
         },
-        cache: 'no-store',
-      }
+      },
+      3000
     );
 
-    if (res.ok) {
-      const data = await res.json();
-      if (data && Array.isArray(data.results)) {
-        for (const item of data.results) {
-          if (!item.encrypted_media_url) continue;
-          let directUrl = decryptDES(item.encrypted_media_url);
-          if (directUrl) {
-            directUrl = directUrl.replace(/_96\.mp4$/, '_320.mp4').replace(/_160\.mp4$/, '_320.mp4');
+    if (!res.ok) return [];
+    const data = await res.json();
+    if (!data || !Array.isArray(data.results)) return [];
 
-            let artwork = item.image || '';
-            if (artwork) {
-              artwork = artwork.replace(/50x50\.jpg$/, '500x500.jpg').replace(/150x150\.jpg$/, '500x500.jpg');
-            }
-
-            const trackTitle = decodeHtmlEntities(item.song || item.title || 'Unknown Title');
-            const trackArtist = decodeHtmlEntities(item.primary_artists || item.singers || 'Unknown Artist');
-            const key = `${trackTitle.toLowerCase()}_${trackArtist.toLowerCase()}`;
-
-            if (!seenKeys.has(key)) {
-              seenKeys.add(key);
-              results.push({
-                id: `saavn_${item.id}`,
-                title: trackTitle,
-                artist: trackArtist,
-                album: decodeHtmlEntities(item.album || ''),
-                duration: parseInt(item.duration, 10) || 0,
-                image: artwork,
-                audioUrl: directUrl,
-                source: 'saavn',
-              });
-            }
-          }
+    const list: SearchTrack[] = [];
+    for (const item of data.results) {
+      if (!item.encrypted_media_url) continue;
+      let directUrl = decryptDES(item.encrypted_media_url);
+      if (directUrl) {
+        directUrl = directUrl.replace(/_96\.mp4$/, '_320.mp4').replace(/_160\.mp4$/, '_320.mp4');
+        let artwork = item.image || '';
+        if (artwork) {
+          artwork = artwork.replace(/50x50\.jpg$/, '500x500.jpg').replace(/150x150\.jpg$/, '500x500.jpg');
         }
+        list.push({
+          id: `saavn_${item.id}`,
+          title: decodeHtmlEntities(item.song || item.title || 'Unknown Title'),
+          artist: decodeHtmlEntities(item.primary_artists || item.singers || 'Unknown Artist'),
+          album: decodeHtmlEntities(item.album || ''),
+          duration: parseInt(item.duration, 10) || 0,
+          image: artwork,
+          audioUrl: directUrl,
+          source: 'saavn' as const,
+        });
       }
     }
-  } catch (err) {
-    console.error('Saavn search error:', err);
+    return list;
+  } catch {
+    return [];
+  }
+}
+
+export async function searchTracks(query: string): Promise<SearchTrack[]> {
+  const cleanQuery = query.trim();
+  if (!cleanQuery) return [];
+
+  // Execute searches in PARALLEL so response time is under ~1.5 - 2 seconds max
+  const [ymResults, muzofondResults, hitmoResults, saavnResults] = await Promise.all([
+    searchYandex(cleanQuery),
+    searchMuzofond(cleanQuery),
+    searchHitmo(cleanQuery),
+    searchSaavn(cleanQuery),
+  ]);
+
+  const combined = [...ymResults, ...muzofondResults, ...hitmoResults, ...saavnResults];
+  const uniqueList: SearchTrack[] = [];
+  const seenKeys = new Set<string>();
+
+  for (const track of combined) {
+    const key = `${track.title.toLowerCase()}_${track.artist.toLowerCase()}`;
+    if (!seenKeys.has(key)) {
+      seenKeys.add(key);
+      uniqueList.push(track);
+    }
   }
 
-  return results;
+  return uniqueList;
 }
