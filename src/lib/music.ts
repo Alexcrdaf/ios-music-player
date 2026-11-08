@@ -8,7 +8,7 @@ export interface SearchTrack {
   duration: number;
   image: string;
   audioUrl: string;
-  source: 'saavn' | 'itunes' | 'audius';
+  source: 'hitmo' | 'saavn' | 'audius';
 }
 
 function decryptDES(encrypted: string): string | null {
@@ -36,7 +36,8 @@ function decodeHtmlEntities(str: string): string {
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
     .replace(/&ndash;/g, '–')
-    .replace(/&mdash;/g, '—');
+    .replace(/&mdash;/g, '—')
+    .replace(/&nbsp;/g, ' ');
 }
 
 export async function searchTracks(query: string): Promise<SearchTrack[]> {
@@ -44,14 +45,68 @@ export async function searchTracks(query: string): Promise<SearchTrack[]> {
   if (!cleanQuery) return [];
 
   const results: SearchTrack[] = [];
+  const seenTracks = new Set<string>();
 
-  // 1. Primary Source: JioSaavn (Full 320kbps / 160kbps songs, universal catalog)
+  // 1. Primary Source for Russian & CIS & Global Hits: Hitmo (Full MP3s, accurate title/artist search)
+  try {
+    const hitmoRes = await fetch(
+      `https://rus.hitmotop.com/search?q=${encodeURIComponent(cleanQuery)}`,
+      {
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          Accept: 'text/html,application/xhtml+xml',
+          'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+        },
+        cache: 'no-store',
+      }
+    );
+
+    if (hitmoRes.ok) {
+      const html = await hitmoRes.text();
+      const metaRegex = /data-musmeta='([^']+)'/g;
+      let m;
+      let count = 0;
+      while ((m = metaRegex.exec(html)) !== null && count < 25) {
+        try {
+          const item = JSON.parse(m[1]);
+          if (item.url && item.title) {
+            const trackTitle = decodeHtmlEntities(item.title);
+            const trackArtist = decodeHtmlEntities(item.artist || 'Неизвестный исполнитель');
+            const key = `${trackTitle.toLowerCase()}_${trackArtist.toLowerCase()}`;
+
+            if (!seenTracks.has(key)) {
+              seenTracks.add(key);
+              results.push({
+                id: `hitmo_${item.id || count}_${Date.now()}_${count}`,
+                title: trackTitle,
+                artist: trackArtist,
+                album: 'Single',
+                duration: 0,
+                image: item.img || '',
+                audioUrl: item.url,
+                source: 'hitmo',
+              });
+              count++;
+            }
+          }
+        } catch {
+          // ignore corrupted JSON items
+        }
+      }
+    }
+  } catch (err) {
+    console.error('Hitmo search error:', err);
+  }
+
+  // 2. Secondary Source: International Catalog (JioSaavn 320kbps streams)
   try {
     const res = await fetch(
       `https://www.jiosaavn.com/api.php?__call=search.getResults&_format=json&_marker=0&q=${encodeURIComponent(cleanQuery)}&p=1&n=15`,
       {
         headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
           Accept: 'application/json',
         },
         cache: 'no-store',
@@ -65,25 +120,30 @@ export async function searchTracks(query: string): Promise<SearchTrack[]> {
           if (!item.encrypted_media_url) continue;
           let directUrl = decryptDES(item.encrypted_media_url);
           if (directUrl) {
-            // Upgrade from 96kbps / default to high-quality 320kbps
             directUrl = directUrl.replace(/_96\.mp4$/, '_320.mp4').replace(/_160\.mp4$/, '_320.mp4');
 
-            // Upgrade artwork resolution to 500x500
             let artwork = item.image || '';
             if (artwork) {
               artwork = artwork.replace(/50x50\.jpg$/, '500x500.jpg').replace(/150x150\.jpg$/, '500x500.jpg');
             }
 
-            results.push({
-              id: `saavn_${item.id}`,
-              title: decodeHtmlEntities(item.song || item.title || 'Unknown Title'),
-              artist: decodeHtmlEntities(item.primary_artists || item.singers || 'Unknown Artist'),
-              album: decodeHtmlEntities(item.album || ''),
-              duration: parseInt(item.duration, 10) || 0,
-              image: artwork,
-              audioUrl: directUrl,
-              source: 'saavn',
-            });
+            const trackTitle = decodeHtmlEntities(item.song || item.title || 'Unknown Title');
+            const trackArtist = decodeHtmlEntities(item.primary_artists || item.singers || 'Unknown Artist');
+            const key = `${trackTitle.toLowerCase()}_${trackArtist.toLowerCase()}`;
+
+            if (!seenTracks.has(key)) {
+              seenTracks.add(key);
+              results.push({
+                id: `saavn_${item.id}`,
+                title: trackTitle,
+                artist: trackArtist,
+                album: decodeHtmlEntities(item.album || ''),
+                duration: parseInt(item.duration, 10) || 0,
+                image: artwork,
+                audioUrl: directUrl,
+                source: 'saavn',
+              });
+            }
           }
         }
       }
@@ -92,7 +152,7 @@ export async function searchTracks(query: string): Promise<SearchTrack[]> {
     console.error('Saavn search error:', err);
   }
 
-  // 2. Secondary fallback / addition: Audius (indie & remix catalog)
+  // 3. Fallback: Audius for indie & remix searches
   if (results.length < 5) {
     try {
       const res = await fetch(
@@ -110,16 +170,20 @@ export async function searchTracks(query: string): Promise<SearchTrack[]> {
               '';
             const audioUrl = `https://api.audius.co/v1/tracks/${item.id}/stream?app_name=iOSMusicApp`;
 
-            results.push({
-              id: `audius_${item.id}`,
-              title: item.title,
-              artist: item.user?.name || 'Unknown Artist',
-              album: item.genre || '',
-              duration: item.duration || 0,
-              image: artwork,
-              audioUrl: audioUrl,
-              source: 'audius',
-            });
+            const key = `${item.title.toLowerCase()}_${(item.user?.name || '').toLowerCase()}`;
+            if (!seenTracks.has(key)) {
+              seenTracks.add(key);
+              results.push({
+                id: `audius_${item.id}`,
+                title: item.title,
+                artist: item.user?.name || 'Unknown Artist',
+                album: item.genre || '',
+                duration: item.duration || 0,
+                image: artwork,
+                audioUrl: audioUrl,
+                source: 'audius',
+              });
+            }
           }
         }
       }
