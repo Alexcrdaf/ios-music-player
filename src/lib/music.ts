@@ -38,7 +38,6 @@ function decodeHtmlEntities(str: string): string {
     .replace(/&nbsp;/g, ' ');
 }
 
-// Fast fetch with guaranteed timeout so Vercel serverless function never times out (502 / 504)
 async function fetchWithTimeout(url: string, options: RequestInit = {}, timeoutMs = 3500) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
@@ -53,7 +52,7 @@ async function fetchWithTimeout(url: string, options: RequestInit = {}, timeoutM
   }
 }
 
-// 1. Yandex Music Search (Accurate discographies, full albums, indie & rock)
+// 1. Yandex Music Search (tracks + popular artist tracks)
 async function searchYandex(query: string): Promise<SearchTrack[]> {
   try {
     const res = await fetchWithTimeout(
@@ -71,7 +70,7 @@ async function searchYandex(query: string): Promise<SearchTrack[]> {
     if (!res.ok) return [];
     const data = await res.json();
     const tracks = data.result?.tracks?.results || [];
-    return tracks.slice(0, 20).map((t: any) => ({
+    const list: SearchTrack[] = tracks.slice(0, 25).map((t: any) => ({
       id: `ym_${t.id}`,
       title: decodeHtmlEntities(t.title || 'Unknown Title'),
       artist: decodeHtmlEntities(t.artists?.map((a: any) => a.name).join(', ') || 'Unknown Artist'),
@@ -81,12 +80,44 @@ async function searchYandex(query: string): Promise<SearchTrack[]> {
       audioUrl: `/api/stream?source=ym&id=${t.id}`,
       source: 'ym' as const,
     }));
+
+    // If query has matched artists, also pull their top popular tracks
+    const matchedArtists = data.result?.artists?.results || [];
+    if (matchedArtists.length > 0) {
+      for (const artist of matchedArtists.slice(0, 2)) {
+        try {
+          const artistRes = await fetchWithTimeout(
+            `https://api.music.yandex.net/artists/${artist.id}/brief-info`,
+            {},
+            2000
+          );
+          if (artistRes.ok) {
+            const artistData = await artistRes.json();
+            const popTracks = artistData.result?.popularTracks || [];
+            for (const pt of popTracks.slice(0, 10)) {
+              list.push({
+                id: `ym_${pt.id}`,
+                title: decodeHtmlEntities(pt.title || 'Unknown Title'),
+                artist: decodeHtmlEntities(pt.artists?.map((a: any) => a.name).join(', ') || artist.name),
+                album: pt.albums?.[0]?.title || '',
+                duration: Math.round((pt.durationMs || 0) / 1000),
+                image: pt.coverUri ? `https://${pt.coverUri.replace('%%', '400x400')}` : '',
+                audioUrl: `/api/stream?source=ym&id=${pt.id}`,
+                source: 'ym' as const,
+              });
+            }
+          }
+        } catch {}
+      }
+    }
+
+    return list;
   } catch {
     return [];
   }
 }
 
-// 2. Muzofond Search (Rare songs, alternative archives)
+// 2. Muzofond Search
 async function searchMuzofond(query: string): Promise<SearchTrack[]> {
   try {
     const res = await fetchWithTimeout(
@@ -110,7 +141,7 @@ async function searchMuzofond(query: string): Promise<SearchTrack[]> {
     const list: SearchTrack[] = [];
     let m;
     let count = 0;
-    while ((m = trackRegex.exec(html)) !== null && count < 15) {
+    while ((m = trackRegex.exec(html)) !== null && count < 20) {
       const streamUrl = m[2];
       const artist = decodeHtmlEntities(m[3].replace(/<[^>]+>/g, '').trim());
       const title = decodeHtmlEntities(m[4].replace(/<[^>]+>/g, '').trim());
@@ -153,7 +184,7 @@ async function searchHitmo(query: string): Promise<SearchTrack[]> {
     const list: SearchTrack[] = [];
     let m;
     let count = 0;
-    while ((m = metaRegex.exec(html)) !== null && count < 15) {
+    while ((m = metaRegex.exec(html)) !== null && count < 20) {
       try {
         const item = JSON.parse(m[1]);
         if (item.url && item.title) {
@@ -185,7 +216,7 @@ async function searchHitmo(query: string): Promise<SearchTrack[]> {
 async function searchSaavn(query: string): Promise<SearchTrack[]> {
   try {
     const res = await fetchWithTimeout(
-      `https://www.jiosaavn.com/api.php?__call=search.getResults&_format=json&_marker=0&q=${encodeURIComponent(query)}&p=1&n=10`,
+      `https://www.jiosaavn.com/api.php?__call=search.getResults&_format=json&_marker=0&q=${encodeURIComponent(query)}&p=1&n=15`,
       {
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -227,11 +258,53 @@ async function searchSaavn(query: string): Promise<SearchTrack[]> {
   }
 }
 
+// Relevance calculation so exact artist and song title always sort to the top
+function calculateRelevanceScore(track: SearchTrack, query: string): number {
+  const q = query.toLowerCase().trim();
+  const trackTitle = track.title.toLowerCase();
+  const trackArtist = track.artist.toLowerCase();
+  const fullText = `${trackTitle} ${trackArtist}`;
+
+  let score = 0;
+
+  // Exact full query match
+  if (fullText.includes(q)) {
+    score += 150;
+  }
+  if (trackTitle === q) {
+    score += 200;
+  }
+  if (trackArtist === q) {
+    score += 180;
+  }
+
+  // Word-by-word matching
+  const words = q.split(/\s+/).filter(Boolean);
+  let matchedWords = 0;
+  for (const w of words) {
+    if (trackTitle.includes(w)) {
+      score += 40;
+      matchedWords++;
+    }
+    if (trackArtist.includes(w)) {
+      score += 50;
+      matchedWords++;
+    }
+  }
+
+  // Bonus if all query words are present
+  if (words.length > 0 && matchedWords >= words.length) {
+    score += 100;
+  }
+
+  return score;
+}
+
 export async function searchTracks(query: string): Promise<SearchTrack[]> {
   const cleanQuery = query.trim();
   if (!cleanQuery) return [];
 
-  // Execute searches in PARALLEL so response time is under ~1.5 - 2 seconds max
+  // Parallel search across all engines
   const [ymResults, muzofondResults, hitmoResults, saavnResults] = await Promise.all([
     searchYandex(cleanQuery),
     searchMuzofond(cleanQuery),
@@ -250,6 +323,11 @@ export async function searchTracks(query: string): Promise<SearchTrack[]> {
       uniqueList.push(track);
     }
   }
+
+  // Sort by calculated relevance score descending
+  uniqueList.sort((a, b) => {
+    return calculateRelevanceScore(b, cleanQuery) - calculateRelevanceScore(a, cleanQuery);
+  });
 
   return uniqueList;
 }
