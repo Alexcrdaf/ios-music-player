@@ -18,7 +18,8 @@
     "next": "16.4.5",
     "node-forge": "^1.4.3",
     "react": "19.3.0",
-    "react-dom": "19.3.0"
+    "react-dom": "19.3.0",
+    "soundcloud-scraper": "^5.0.3"
   },
   "devDependencies": {
     "@tailwindcss/turbopack": "^4",

@@ -8,7 +8,7 @@ export interface SearchTrack {
   duration: number;
   image: string;
   audioUrl: string;
-  source: 'hitmo' | 'saavn' | 'audius';
+  source: 'ym' | 'muzofond' | 'hitmo' | 'saavn' | 'audius';
 }
 
 function decryptDES(encrypted: string): string | null {
@@ -21,12 +21,10 @@ function decryptDES(encrypted: string): string | null {
     decipher.finish();
     return decipher.output.toString();
   } catch (err) {
-    console.error('DES decryption error:', err);
     return null;
   }
 }
 
-// Clean HTML entities from titles like &quot;, &#039;, etc.
 function decodeHtmlEntities(str: string): string {
   if (!str) return '';
   return str
@@ -45,9 +43,98 @@ export async function searchTracks(query: string): Promise<SearchTrack[]> {
   if (!cleanQuery) return [];
 
   const results: SearchTrack[] = [];
-  const seenTracks = new Set<string>();
+  const seenKeys = new Set<string>();
 
-  // 1. Primary Source for Russian & CIS & Global Hits: Hitmo (Full MP3s, accurate title/artist search)
+  // 1. Primary Source: Yandex Music Catalog (Finds "Свидетельство о смерти", "Burial - Forgive", Russian & Global discographies)
+  try {
+    const ymRes = await fetch(
+      `https://api.music.yandex.net/search?text=${encodeURIComponent(cleanQuery)}&type=all&page=0`,
+      {
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko)',
+          Accept: 'application/json',
+        },
+        cache: 'no-store',
+      }
+    );
+
+    if (ymRes.ok) {
+      const ymData = await ymRes.json();
+      const tracks = ymData.result?.tracks?.results || [];
+      for (const t of tracks.slice(0, 20)) {
+        const title = decodeHtmlEntities(t.title || 'Unknown Title');
+        const artist = decodeHtmlEntities(t.artists?.map((a: any) => a.name).join(', ') || 'Unknown Artist');
+        const key = `${title.toLowerCase()}_${artist.toLowerCase()}`;
+
+        if (!seenKeys.has(key)) {
+          seenKeys.add(key);
+          const artwork = t.coverUri
+            ? `https://${t.coverUri.replace('%%', '400x400')}`
+            : '';
+
+          results.push({
+            id: `ym_${t.id}`,
+            title,
+            artist,
+            album: t.albums?.[0]?.title || '',
+            duration: Math.round((t.durationMs || 0) / 1000),
+            image: artwork,
+            audioUrl: `/api/stream?source=ym&id=${t.id}`,
+            source: 'ym',
+          });
+        }
+      }
+    }
+  } catch (err) {
+    console.error('YM search error:', err);
+  }
+
+  // 2. Secondary Source: Muzofond (Finds rare underground tracks, "Свидетельство о смерти", indie bootlegs)
+  try {
+    const muzoRes = await fetch(`https://muzofond.fm/search/${encodeURIComponent(cleanQuery)}`, {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        Accept: 'text/html,application/xhtml+xml',
+        'Accept-Language': 'ru-RU,ru;q=0.9,en;q=0.8',
+      },
+      cache: 'no-store',
+    });
+
+    if (muzoRes.ok) {
+      const html = await muzoRes.text();
+      const trackRegex =
+        /<li[^>]+class="item"[^>]*data-id="([^"]+)"[\s\S]*?data-url="(https:\/\/[^"]*muzofond\.fm\/[^"]+)"[\s\S]*?<span[^>]+class="artist">([\s\S]*?)<\/span>[\s\S]*?<a[^>]+data-trackLink[^>]*>([\s\S]*?)<\/a>/g;
+      let m;
+      let count = 0;
+      while ((m = trackRegex.exec(html)) !== null && count < 20) {
+        const streamUrl = m[2];
+        const artist = decodeHtmlEntities(m[3].replace(/<[^>]+>/g, '').trim());
+        const title = decodeHtmlEntities(m[4].replace(/<[^>]+>/g, '').trim());
+        const key = `${title.toLowerCase()}_${artist.toLowerCase()}`;
+
+        if (!seenKeys.has(key)) {
+          seenKeys.add(key);
+          results.push({
+            id: `muzofond_${m[1]}_${count}`,
+            title,
+            artist,
+            album: 'Single',
+            duration: 0,
+            image: '',
+            audioUrl: `/api/stream?url=${encodeURIComponent(streamUrl)}`,
+            source: 'muzofond',
+          });
+          count++;
+        }
+      }
+    }
+  } catch (err) {
+    console.error('Muzofond search error:', err);
+  }
+
+  // 3. Third Source: Hitmo (for hits, rap, and CIS pop)
   try {
     const hitmoRes = await fetch(
       `https://rus.hitmotop.com/search?q=${encodeURIComponent(cleanQuery)}`,
@@ -56,7 +143,6 @@ export async function searchTracks(query: string): Promise<SearchTrack[]> {
           'User-Agent':
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
           Accept: 'text/html,application/xhtml+xml',
-          'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
         },
         cache: 'no-store',
       }
@@ -67,7 +153,7 @@ export async function searchTracks(query: string): Promise<SearchTrack[]> {
       const metaRegex = /data-musmeta='([^']+)'/g;
       let m;
       let count = 0;
-      while ((m = metaRegex.exec(html)) !== null && count < 30) {
+      while ((m = metaRegex.exec(html)) !== null && count < 15) {
         try {
           const item = JSON.parse(m[1]);
           if (item.url && item.title) {
@@ -80,11 +166,8 @@ export async function searchTracks(query: string): Promise<SearchTrack[]> {
               rawUrl = `https://rus.hitmotop.com${rawUrl}`;
             }
 
-            // Route through server proxy so iOS Safari never gets blocked by third-party CDN referer or CORS issues
-            const audioProxyUrl = `/api/stream?url=${encodeURIComponent(rawUrl)}`;
-
-            if (!seenTracks.has(key)) {
-              seenTracks.add(key);
+            if (!seenKeys.has(key)) {
+              seenKeys.add(key);
               results.push({
                 id: `hitmo_${item.id || count}_${count}`,
                 title: trackTitle,
@@ -92,29 +175,27 @@ export async function searchTracks(query: string): Promise<SearchTrack[]> {
                 album: 'Single',
                 duration: 0,
                 image: item.img || '',
-                audioUrl: audioProxyUrl,
+                audioUrl: `/api/stream?url=${encodeURIComponent(rawUrl)}`,
                 source: 'hitmo',
               });
               count++;
             }
           }
-        } catch {
-          // ignore corrupted JSON items
-        }
+        } catch {}
       }
     }
   } catch (err) {
     console.error('Hitmo search error:', err);
   }
 
-  // 2. Secondary Source: International Catalog (JioSaavn 320kbps streams)
+  // 4. Fourth Source: International Catalog (JioSaavn 320kbps streams)
   try {
     const res = await fetch(
       `https://www.jiosaavn.com/api.php?__call=search.getResults&_format=json&_marker=0&q=${encodeURIComponent(cleanQuery)}&p=1&n=15`,
       {
         headers: {
           'User-Agent':
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
           Accept: 'application/json',
         },
         cache: 'no-store',
@@ -139,8 +220,8 @@ export async function searchTracks(query: string): Promise<SearchTrack[]> {
             const trackArtist = decodeHtmlEntities(item.primary_artists || item.singers || 'Unknown Artist');
             const key = `${trackTitle.toLowerCase()}_${trackArtist.toLowerCase()}`;
 
-            if (!seenTracks.has(key)) {
-              seenTracks.add(key);
+            if (!seenKeys.has(key)) {
+              seenKeys.add(key);
               results.push({
                 id: `saavn_${item.id}`,
                 title: trackTitle,
@@ -158,46 +239,6 @@ export async function searchTracks(query: string): Promise<SearchTrack[]> {
     }
   } catch (err) {
     console.error('Saavn search error:', err);
-  }
-
-  // 3. Fallback: Audius for indie & remix searches
-  if (results.length < 5) {
-    try {
-      const res = await fetch(
-        `https://api.audius.co/v1/tracks/search?query=${encodeURIComponent(cleanQuery)}&app_name=iOSMusicApp`,
-        { cache: 'no-store' }
-      );
-      if (res.ok) {
-        const data = await res.json();
-        if (data && Array.isArray(data.data)) {
-          for (const item of data.data.slice(0, 10)) {
-            const artwork =
-              item.artwork?.['480x480'] ||
-              item.artwork?.['150x150'] ||
-              item.artwork?.['1000x1000'] ||
-              '';
-            const audioUrl = `https://api.audius.co/v1/tracks/${item.id}/stream?app_name=iOSMusicApp`;
-
-            const key = `${item.title.toLowerCase()}_${(item.user?.name || '').toLowerCase()}`;
-            if (!seenTracks.has(key)) {
-              seenTracks.add(key);
-              results.push({
-                id: `audius_${item.id}`,
-                title: item.title,
-                artist: item.user?.name || 'Unknown Artist',
-                album: item.genre || '',
-                duration: item.duration || 0,
-                image: artwork,
-                audioUrl: audioUrl,
-                source: 'audius',
-              });
-            }
-          }
-        }
-      }
-    } catch (e) {
-      console.error('Audius search error:', e);
-    }
   }
 
   return results;
